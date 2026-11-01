@@ -166,6 +166,7 @@ public class PlaybackKeepAliveService extends Service {
         if (s == null || json == null) return;
         s.handler.post(() -> {
             if (s.queue.isEmpty()) return;
+            s.releasePreloadedPlayer();
             s.parseQueue(json);
             if (index >= 0 && index < s.queue.size()) s.currentIndex = index;
             else if (s.currentIndex >= s.queue.size()) s.currentIndex = s.queue.size() - 1;
@@ -201,6 +202,13 @@ public class PlaybackKeepAliveService extends Service {
 
     private MediaPlayer fadeOutPlayer;
     private Runnable fadeRunnable;
+
+    // Prepare the next track in a silent second deck while the current song keeps playing.
+    // This avoids starting the fade only after an asynchronous prepare operation.
+    private MediaPlayer preloadedPlayer;
+    private Track preloadedTrack;
+    private int preloadedIndex = -1;
+    private boolean preloadedPrepared = false;
 
     private Visualizer visualizer;
     private boolean vizWanted = false;
@@ -259,6 +267,7 @@ public class PlaybackKeepAliveService extends Service {
     private void onEffectsChanged() {
         String json = latestEffectsJson;
         if (json != null) parseEffects(json);
+        if (crossfadeMs <= 0) releasePreloadedPlayer();
 
         if (player != null && !isPreparing) {
             Fx fx = effectiveFx(currentTrack());
@@ -507,10 +516,168 @@ public class PlaybackKeepAliveService extends Service {
             // to compare the remaining media time with real elapsed wall-clock time.
             float tempo = appliedTempo > 0.1f ? appliedTempo : 1f;
             float remainingMs = Math.max(0, duration - position) / tempo;
-            // Give the next URI time to prepare before beginning the volume ramp.
-            if (remainingMs <= fade + 900) startCrossfade();
+
+            // Preload several seconds ahead, without interrupting the current player.
+            // Start the actual overlap only when the configured fade window begins.
+            if (preloadedPlayer == null && remainingMs <= fade + 5000) {
+                prepareNextTrackForCrossfade();
+            }
+            if (preloadedPlayer != null && preloadedPrepared && remainingMs <= fade) {
+                promotePreloadedTrack(true);
+            }
         } catch (IllegalStateException e) {
             Log.w(TAG, "Unable to read playback position for crossfade", e);
+        }
+    }
+
+    private int getNextCrossfadeIndex() {
+        if (queue.size() < 2) return -1;
+        if (repeatMode == 2) {
+            int next = currentIndex;
+            for (int attempt = 0; attempt < 5 && next == currentIndex; attempt++) {
+                next = (int) (Math.random() * queue.size());
+            }
+            return next == currentIndex ? (currentIndex + 1) % queue.size() : next;
+        }
+        return (currentIndex + 1) % queue.size();
+    }
+
+    private void prepareNextTrackForCrossfade() {
+        if (preloadedPlayer != null || player == null || repeatMode == 1) return;
+        final int nextIndex = getNextCrossfadeIndex();
+        if (nextIndex < 0 || nextIndex >= queue.size()) return;
+        final Track track = queue.get(nextIndex);
+        final MediaPlayer next = new MediaPlayer();
+        preloadedPlayer = next;
+        preloadedTrack = track;
+        preloadedIndex = nextIndex;
+        preloadedPrepared = false;
+        try {
+            next.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build());
+            String source = track.id;
+            if (source == null || source.isEmpty()) source = track.url;
+            if (source == null || source.isEmpty()) {
+                throw new IllegalArgumentException("No audio URI for preloaded track");
+            }
+            if (source.startsWith("content://") || source.startsWith("file://")
+                    || source.startsWith("android.resource://")) {
+                next.setDataSource(getApplicationContext(), Uri.parse(source));
+            } else {
+                next.setDataSource(source);
+            }
+            next.setOnPreparedListener(mp -> {
+                if (preloadedPlayer != mp) return;
+                preloadedPrepared = true;
+                Log.d(TAG, "Next track preloaded for crossfade: " + track.title);
+                scheduleFadeWatcher();
+            });
+            next.setOnErrorListener((mp, what, extra) -> {
+                Log.w(TAG, "Unable to preload next track for crossfade: " + track.title
+                        + " (" + what + ", " + extra + ")");
+                releasePreloadedPlayer();
+                return true;
+            });
+            next.prepareAsync();
+        } catch (Exception e) {
+            Log.w(TAG, "Unable to prepare next track for crossfade", e);
+            releasePreloadedPlayer();
+        }
+    }
+
+    private void releasePreloadedPlayer() {
+        MediaPlayer pending = preloadedPlayer;
+        preloadedPlayer = null;
+        preloadedTrack = null;
+        preloadedIndex = -1;
+        preloadedPrepared = false;
+        if (pending != null) {
+            try {
+                pending.setOnPreparedListener(null);
+                pending.setOnCompletionListener(null);
+                pending.setOnErrorListener(null);
+                pending.reset();
+                pending.release();
+            } catch (Exception ignored) { }
+        }
+    }
+
+    /** Promote the already-prepared next deck, optionally overlapping the current song. */
+    private void promotePreloadedTrack(boolean withFade) {
+        if (preloadedPlayer == null || !preloadedPrepared || preloadedTrack == null) return;
+        final MediaPlayer incoming = preloadedPlayer;
+        final Track track = preloadedTrack;
+        final int nextIndex = preloadedIndex;
+        final MediaPlayer outgoing = player;
+
+        preloadedPlayer = null;
+        preloadedTrack = null;
+        preloadedIndex = -1;
+        preloadedPrepared = false;
+        handler.removeCallbacks(ticker);
+        releaseVisualizer();
+
+        if (outgoing != null) {
+            try {
+                outgoing.setOnPreparedListener(null);
+                outgoing.setOnCompletionListener(null);
+                outgoing.setOnErrorListener(null);
+            } catch (Exception ignored) { }
+        }
+        if (withFade && outgoing != null) {
+            fadeOutPlayer = outgoing;
+        } else if (outgoing != null) {
+            try { outgoing.reset(); outgoing.release(); } catch (Exception ignored) { }
+            fadeOutPlayer = null;
+        }
+
+        player = incoming;
+        currentIndex = nextIndex;
+        isPreparing = false;
+        currentTitle = track.title;
+        currentArtist = track.artist;
+        currentAlbum = track.album;
+        if (currentArtwork != null && !currentArtwork.isRecycled()) currentArtwork.recycle();
+        currentArtwork = null;
+        loadArtworkInBackground(track);
+
+        appliedTempo = 1f;
+        appliedPitch = 1f;
+        paramsDirty = false;
+        try {
+            Fx fx = effectiveFx(track);
+            applyReverb(incoming, fx);
+            applyPlaybackParams(incoming, fx);
+            incoming.setVolume(withFade ? 0f : baseVolume(), withFade ? 0f : baseVolume());
+            incoming.setOnCompletionListener(mp -> {
+                if (repeatMode == 1) playCurrentTrack();
+                else playNext();
+            });
+            incoming.setOnErrorListener((mp, what, extra) -> {
+                Log.e(TAG, "MediaPlayer error after crossfade preload: " + what + ", " + extra);
+                isPreparing = false;
+                finishCrossfade();
+                releasePlayer();
+                publishState();
+                return true;
+            });
+            incoming.start();
+            if (withFade && fadeOutPlayer != null) beginFade(incoming);
+            attachVisualizer();
+            updateMediaSessionMetadata();
+            updateMediaSessionPlaybackState();
+            showNotification();
+            scheduleTicker();
+            scheduleFadeWatcher();
+            publishState();
+            Log.d(TAG, withFade ? "Crossfade started with preloaded track" : "Preloaded track started after completion");
+        } catch (Exception e) {
+            Log.e(TAG, "Unable to start preloaded crossfade track", e);
+            finishCrossfade();
+            releasePlayer();
+            publishState();
         }
     }
 
@@ -564,6 +731,8 @@ public class PlaybackKeepAliveService extends Service {
      * plain start, e.g. when paused, when nothing is playing, or during another fade.
      */
     private void switchTrack() {
+        // A user-requested track change supersedes any automatically preloaded next song.
+        releasePreloadedPlayer();
         if (crossfadeMs > 0 && !isPreparing && fadeOutPlayer == null && isPlayerPlaying()) {
             handOffToFade();
             playCurrentTrack(true);
@@ -990,6 +1159,7 @@ public class PlaybackKeepAliveService extends Service {
      *               playing out (crossfade); the previous player is in fadeOutPlayer.
      */
     private void playCurrentTrack(final boolean fadeIn) {
+        if (!fadeIn) releasePreloadedPlayer();
         if (currentIndex < 0 || currentIndex >= queue.size()) {
             Log.w(TAG, "Invalid current track index");
             if (fadeIn) finishCrossfade();
@@ -1096,6 +1266,10 @@ public class PlaybackKeepAliveService extends Service {
             player.setOnCompletionListener(mediaPlayer -> {
                 if (repeatMode == 1) {
                     playCurrentTrack();
+                } else if (preloadedPlayer != null && preloadedPrepared) {
+                    // If the current song ends before the watcher gets its final tick,
+                    // use the already-prepared next deck without an unnecessary re-prepare.
+                    promotePreloadedTrack(false);
                 } else {
                     playNext();
                 }
@@ -1288,6 +1462,7 @@ public class PlaybackKeepAliveService extends Service {
         handler.removeCallbacks(ticker);
         handler.removeCallbacks(fadeWatcher);
         releaseVisualizer();
+        releasePreloadedPlayer();
 
         if (player != null) {
             try {
